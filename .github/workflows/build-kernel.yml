@@ -1,0 +1,151 @@
+name: Build Realme 10 Pro (holi) QGKI Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      localversion:
+        description: 'LOCALVERSION suffix — must be empty or exactly match `adb shell uname -r` output to avoid bootloop'
+        required: false
+        default: ''
+
+env:
+  KERNEL_REPO: https://github.com/realme-kernel-opensource/realme_10pro-AndroidT-kernel-source.git
+  KERNEL_DIR: kernel_source
+  CONFIG_FILE: vendor/holi_QGKI.config
+  CLANG_VERSION: clang-r416183b
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-13.0.0_r1/clang-r416183b.1.tar.gz
+  ARCH: arm64
+  SUBARCH: arm64
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: realme-kernel-opensource/realme_10pro-AndroidT-kernel-source
+          path: ${{ env.KERNEL_DIR }}
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex \
+            git libssl-dev libncurses-dev python3 python3-pip \
+            zip unzip rsync device-tree-compiler
+
+      - name: Cache AOSP clang toolchain
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: toolchain/clang
+          key: ${{ env.CLANG_VERSION }}-clang-toolchain
+
+      - name: Download AOSP prebuilt clang
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p toolchain/clang
+          curl -L "$CLANG_URL" -o clang.tar.gz
+          tar -xzf clang.tar.gz -C toolchain/clang
+          rm clang.tar.gz
+
+      - name: Export toolchain path
+        run: |
+          echo "$GITHUB_WORKSPACE/toolchain/clang/bin" >> "$GITHUB_PATH"
+          echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> "$GITHUB_ENV"
+          echo "CROSS_COMPILE=aarch64-linux-android-" >> "$GITHUB_ENV"
+          echo "CROSS_COMPILE_ARM32=arm-linux-androideabi-" >> "$GITHUB_ENV"
+
+      - name: Verify clang version
+        run: clang --version
+
+      - name: Apply LOCALVERSION (vermagic-critical)
+        if: ${{ github.event.inputs.localversion != '' }}
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          echo "Setting CONFIG_LOCALVERSION to: ${{ github.event.inputs.localversion }}"
+          echo "CONFIG_LOCALVERSION=\"${{ github.event.inputs.localversion }}\"" >> arch/arm64/configs/${CONFIG_FILE}
+          # Force vermagic to be non-automatic so it doesn't append a random suffix
+          echo "# CONFIG_LOCALVERSION_AUTO is not set" >> arch/arm64/configs/${CONFIG_FILE}
+
+      - name: Generate .config
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          make O=out ARCH=$ARCH CC=clang vendor/holi_QGKI.config
+
+      - name: Build kernel Image + DTBs
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          make O=out ARCH=$ARCH SUBARCH=$SUBARCH CC=clang \
+            CLANG_TRIPLE=$CLANG_TRIPLE \
+            CROSS_COMPILE=$CROSS_COMPILE \
+            CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 \
+            -j$(nproc) Image dtbs dtbo.img 2>&1 | tee build.log
+          # Some trees don't wire dtbo.img into the default target — fall back
+          # to building dtbs only if the combined target above fails/no-ops
+          if [ ! -f out/arch/arm64/boot/dtbo.img ]; then
+            make O=out ARCH=$ARCH SUBARCH=$SUBARCH CC=clang \
+              CLANG_TRIPLE=$CLANG_TRIPLE \
+              CROSS_COMPILE=$CROSS_COMPILE \
+              CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 \
+              -j$(nproc) dtbs 2>&1 | tee -a build.log
+          fi
+
+      - name: Locate mkdtimg and pack dtbo.img if not already built
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          if [ -f out/arch/arm64/boot/dtbo.img ]; then
+            echo "dtbo.img already produced by kernel build target."
+            exit 0
+          fi
+          echo "Searching tree for mkdtimg tool and .dtbo fragments..."
+          MKDTIMG=$(find . -iname "mkdtimg" -type f | head -n1)
+          DTBO_LIST=$(find out -iname "*.dtbo" 2>/dev/null)
+          if [ -n "$MKDTIMG" ] && [ -n "$DTBO_LIST" ]; then
+            chmod +x "$MKDTIMG"
+            "$MKDTIMG" create out/arch/arm64/boot/dtbo.img --page_size=4096 $DTBO_LIST
+            echo "Packed dtbo.img via $MKDTIMG"
+          else
+            echo "::warning::Could not auto-locate mkdtimg or .dtbo fragments — check the repo's device tree makefiles (arch/arm64/boot/dts/vendor/qcom/holi*.mk or similar) for the correct dtbo target name and adjust this step manually."
+          fi
+
+      - name: Build and install kernel modules
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          make O=out ARCH=$ARCH SUBARCH=$SUBARCH CC=clang \
+            CLANG_TRIPLE=$CLANG_TRIPLE \
+            CROSS_COMPILE=$CROSS_COMPILE \
+            CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 \
+            -j$(nproc) modules
+          make O=out ARCH=$ARCH \
+            INSTALL_MOD_PATH=modules_out \
+            INSTALL_MOD_STRIP=1 \
+            modules_install
+
+      - name: Clean symlink loops from modules_install
+        working-directory: ${{ env.KERNEL_DIR }}/out/modules_out
+        run: |
+          # modules_install creates build/source symlinks back into the tree,
+          # which loop and blow up packaging steps — strip them out
+          find . -type l -delete
+
+      - name: Package build output
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          mkdir -p ../output
+          cp out/arch/arm64/boot/Image ../output/ 2>/dev/null || true
+          cp out/arch/arm64/boot/Image.gz ../output/ 2>/dev/null || true
+          cp out/arch/arm64/boot/dtbo.img ../output/ 2>/dev/null || true
+          cp out/arch/arm64/boot/dtb ../output/ 2>/dev/null || true
+          cp -r out/modules_out ../output/modules
+          cp build.log ../output/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: holi_QGKI-kernel-${{ github.run_number }}
+          path: output/
+          retention-days: 14
+          
